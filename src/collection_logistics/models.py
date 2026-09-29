@@ -18,6 +18,19 @@ RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
 
 
+def risk_index_value(value: object, field: str) -> str:
+    """校验指标系列，支持 CUSTOM:<名称> 形式的自定义系列。"""
+    result = required_text(value, field, 32).upper()
+    if result in RISK_INDEXES - {"CUSTOM"}:
+        return result
+    suffix = result[len("CUSTOM:"):] if result.startswith("CUSTOM:") else ""
+    if suffix and IDENTIFIER.fullmatch(suffix):
+        return result
+    raise ValidationFailed(
+        f"{field} 必须是 HUMIDITY、INJURY、CONGESTION、HAZMAT、SECONDARY 或 CUSTOM:<名称>"
+    )
+
+
 def required_text(value: object, field: str, maximum: int = 256) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationFailed(f"{field} 不能为空")
@@ -80,9 +93,7 @@ class RiskIndexRecord:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RiskIndexRecord":
-        risk_index = required_text(raw.get("risk_index"), "risk_index", 16).upper()
-        if risk_index not in RISK_INDEXES - {"CUSTOM"}:
-            raise ValidationFailed("risk_index 必须是 HUMIDITY、INJURY、CONGESTION、HAZMAT 或 SECONDARY")
+        risk_index = risk_index_value(raw.get("risk_index"), "risk_index")
         observed_at = required_text(raw.get("observed_at"), "observed_at", 40)
         try:
             parse_utc(observed_at, "observed_at")
@@ -223,12 +234,39 @@ class DispatchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ScenarioObservationBinding:
+    """情景创建时固定的观测输入约束：指标系列、来源修订与适用日期。"""
+
+    risk_index: str
+    source_revision: str
+    duty_date: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ScenarioObservationBinding":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("observation 必须是对象")
+        return cls(
+            risk_index=risk_index_value(raw.get("risk_index"), "observation.risk_index"),
+            source_revision=identifier(raw.get("source_revision"), "observation.source_revision"),
+            duty_date=date_text(raw.get("duty_date"), "observation.duty_date"),
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "risk_index": self.risk_index,
+            "source_revision": self.source_revision,
+            "duty_date": self.duty_date,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ResponseScenario:
     scenario_id: str
     name: str
     risk_index_drop_percent: Decimal
     route_capacity_changes: Mapping[str, Decimal]
     demand_changes: Mapping[str, Decimal]
+    observation: ScenarioObservationBinding
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ResponseScenario":
@@ -259,4 +297,5 @@ class ResponseScenario:
             ),
             route_capacity_changes=parsed_road_corridors,
             demand_changes=parsed_demand,
+            observation=ScenarioObservationBinding.from_dict(raw["observation"]),
         )

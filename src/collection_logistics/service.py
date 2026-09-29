@@ -7,7 +7,7 @@ import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
@@ -477,10 +477,21 @@ class CollectionLogisticsService:
                     "VALUES(?,?,?,?,?,?)",
                     (scenario.scenario_id, scenario.name, definition, content_sha256, actor_id, self._now()),
                 )
-                self._audit("scenario", scenario.scenario_id, "scenario.created", actor_id, {"sha256": content_sha256})
+                self._audit(
+                    "scenario",
+                    scenario.scenario_id,
+                    "scenario.created",
+                    actor_id,
+                    {"sha256": content_sha256, "observation": scenario.observation.as_dict()},
+                )
         except sqlite3.IntegrityError as exc:
             raise Conflict("情景编号或内容已经存在") from exc
-        return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256}
+        return {
+            "scenario_id": scenario.scenario_id,
+            "state": "draft",
+            "sha256": content_sha256,
+            "observation": scenario.observation.as_dict(),
+        }
 
     def approve_scenario(self, actor_id: str, scenario_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "scenario.approve")
@@ -495,7 +506,87 @@ class CollectionLogisticsService:
             self._audit("scenario", scenario_id, "scenario.approved", actor_id, {})
         return {"scenario_id": scenario_id, "state": "approved", "revision": expected_revision + 1}
 
-    def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
+    def _require_any(self, user_id: str, permissions: Iterable[str]) -> sqlite3.Row:
+        user = self._user(user_id)
+        if not any(permission in ROLE_PERMISSIONS[user["role"]] for permission in permissions):
+            raise Forbidden(f"角色 {user['role']} 无权执行该操作")
+        return user
+
+    @staticmethod
+    def _scenario_input_snapshot(
+        scenario_row: sqlite3.Row,
+        scenario: ResponseScenario,
+        observation_row: sqlite3.Row,
+        road_corridors: Sequence[sqlite3.Row],
+        inventory_lots: Sequence[sqlite3.Row],
+    ) -> dict[str, Any]:
+        """构造一次情景运行的完整输入快照，供幂等判定、审计与事后复算共用。"""
+        return {
+            "scenario": {
+                "scenario_id": scenario.scenario_id,
+                "name": scenario.name,
+                "definition_sha256": scenario_row["content_sha256"],
+                "risk_index_drop_percent": decimal_text(scenario.risk_index_drop_percent),
+                "route_capacity_changes": {
+                    key: decimal_text(value) for key, value in sorted(scenario.route_capacity_changes.items())
+                },
+                "demand_changes": {
+                    key: decimal_text(value) for key, value in sorted(scenario.demand_changes.items())
+                },
+            },
+            "observation_selector": {
+                "rule": "exact_match_on_series_revision_and_duty_date",
+                "risk_index": scenario.observation.risk_index,
+                "source_revision": scenario.observation.source_revision,
+                "duty_date": scenario.observation.duty_date,
+            },
+            "observation": {
+                "risk_record_id": int(observation_row["risk_record_id"]),
+                "risk_index": observation_row["risk_index"],
+                "duty_date": observation_row["duty_date"],
+                "index_value": observation_row["index_value"],
+                "source_revision": observation_row["source_revision"],
+                "observed_at": observation_row["observed_at"],
+                "supersedes_risk_record_id": observation_row["supersedes_risk_record_id"],
+                "recorded_by": observation_row["recorded_by"],
+                "recorded_at": observation_row["recorded_at"],
+            },
+            "selection": {
+                "matched": True,
+                "matched_risk_record_id": int(observation_row["risk_record_id"]),
+                "reason": "观测的指标系列、来源修订和适用日期与情景创建时固定的约束完全一致",
+            },
+            "road_corridors": [dict(item) for item in road_corridors],
+            "inventory_lots": [dict(item) for item in inventory_lots],
+        }
+
+    @staticmethod
+    def _projection_from_snapshot(
+        scenario: ResponseScenario, snapshot: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """仅依据快照内容重算情景结果，不读取任何易变的当前数据。"""
+        inventory_totals: dict[tuple[str, str], Decimal] = {}
+        for lot in snapshot["inventory_lots"]:
+            key = (str(lot["center_id"]), str(lot["preservation_resource_kind"]))
+            inventory_totals[key] = inventory_totals.get(key, Decimal()) + Decimal(str(lot["available_units"]))
+        inventory = [
+            {
+                "center_id": center_id,
+                "preservation_resource_kind": kind,
+                "available_units": decimal_text(quantize_volume(total)),
+            }
+            for (center_id, kind), total in sorted(inventory_totals.items())
+        ]
+        return scenario_projection(
+            current_index=Decimal(str(snapshot["observation"]["index_value"])),
+            risk_index_drop_percent=scenario.risk_index_drop_percent,
+            road_corridors=snapshot["road_corridors"],
+            inventory=inventory,
+            route_capacity_changes=scenario.route_capacity_changes,
+            demand_changes=scenario.demand_changes,
+        )
+
+    def run_scenario(self, actor_id: str, scenario_id: str) -> dict[str, Any]:
         self._require(actor_id, "scenario.run")
         row = self.connection.execute(
             "SELECT * FROM response_scenarios WHERE scenario_id=?", (scenario_id,)
@@ -505,48 +596,150 @@ class CollectionLogisticsService:
         if row["state"] != "approved":
             raise InvalidState("只有已批准情景可以运行")
         scenario = ResponseScenario.from_dict(json.loads(row["definition_json"]))
-        index_row = self.connection.execute(
-            "SELECT index_value FROM risk_index_risk_records WHERE duty_date<=? ORDER BY duty_date DESC,risk_record_id DESC LIMIT 1",
-            (as_of_date,),
+        binding = scenario.observation
+        observation_row = self.connection.execute(
+            "SELECT * FROM risk_index_risk_records WHERE risk_index=? AND duty_date=? AND source_revision=? "
+            "ORDER BY risk_record_id DESC LIMIT 1",
+            (binding.risk_index, binding.duty_date, binding.source_revision),
         ).fetchone()
-        if index_row is None:
-            raise InvalidState("截止日期没有可用风险指数")
-        road_corridors = self.connection.execute("SELECT * FROM road_corridors WHERE state='active' ORDER BY corridor_id").fetchall()
-        inventory = self.connection.execute(
-            "SELECT center_id,preservation_resource_kind,sum(CAST(available_units AS REAL)) available_units "
-            "FROM preservation_resource_lots GROUP BY center_id,preservation_resource_kind ORDER BY center_id,preservation_resource_kind"
+        if observation_row is None:
+            # 没有与情景约束完全相符的观测版本：明确停止，不回退到“最新可得”数据，
+            # 并留下审计记录说明阻断原因。
+            with transaction(self.connection, immediate=True):
+                self._audit(
+                    "scenario",
+                    scenario_id,
+                    "scenario.execution_blocked",
+                    actor_id,
+                    {"reason": "no_matching_observation", "observation": binding.as_dict()},
+                )
+            raise InvalidState(
+                "没有与情景约束相符的观测："
+                f"指标系列 {binding.risk_index}、适用日期 {binding.duty_date}、"
+                f"来源修订 {binding.source_revision}，无法生成情景结果"
+            )
+        road_corridors = self.connection.execute(
+            "SELECT * FROM road_corridors WHERE state='active' ORDER BY corridor_id"
         ).fetchall()
-        input_value = {
-            "scenario_sha256": row["content_sha256"],
-            "as_of_date": as_of_date,
-            "index": index_row["index_value"],
-            "road_corridors": [dict(item) for item in road_corridors],
-            "inventory": [dict(item) for item in inventory],
-        }
-        input_sha256 = digest(input_value)
+        inventory_lots = self.connection.execute(
+            "SELECT * FROM preservation_resource_lots ORDER BY center_id,preservation_resource_kind,"
+            "preservation_resource_lot_id"
+        ).fetchall()
+        snapshot = self._scenario_input_snapshot(
+            row, scenario, observation_row, road_corridors, inventory_lots
+        )
+        input_sha256 = digest(snapshot)
         existing = self.connection.execute(
-            "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
-            (scenario_id, as_of_date, input_sha256),
+            "SELECT run_id,result_json,input_snapshot_json FROM response_scenario_runs "
+            "WHERE scenario_id=? AND risk_record_id=? AND input_sha256=?",
+            (scenario_id, observation_row["risk_record_id"], input_sha256),
         ).fetchone()
         if existing is not None:
-            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
-        result = scenario_projection(
-            current_index=Decimal(index_row["index_value"]),
-            risk_index_drop_percent=scenario.risk_index_drop_percent,
-            road_corridors=road_corridors,
-            inventory=inventory,
-            route_capacity_changes=scenario.route_capacity_changes,
-            demand_changes=scenario.demand_changes,
-        )
+            return {
+                "run_id": existing["run_id"],
+                **json.loads(existing["result_json"]),
+                "replayed": True,
+                "observation": snapshot["observation"],
+                "selection": snapshot["selection"],
+                "input_sha256": input_sha256,
+            }
+        result = self._projection_from_snapshot(scenario, snapshot)
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
-                "INSERT INTO response_scenario_runs(scenario_id,as_of_date,input_sha256,result_json,created_by,created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
+                "INSERT INTO response_scenario_runs(scenario_id,risk_record_id,risk_index,duty_date,source_revision,"
+                "input_snapshot_json,input_sha256,result_json,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    scenario_id,
+                    observation_row["risk_record_id"],
+                    binding.risk_index,
+                    binding.duty_date,
+                    binding.source_revision,
+                    canonical_json(snapshot),
+                    input_sha256,
+                    canonical_json(result),
+                    actor_id,
+                    self._now(),
+                ),
             )
             run_id = int(cursor.lastrowid)
-            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
-        return {"run_id": run_id, **result, "replayed": False}
+            self._audit(
+                "scenario",
+                scenario_id,
+                "scenario.executed",
+                actor_id,
+                {
+                    "run_id": run_id,
+                    "input_sha256": input_sha256,
+                    "observation": snapshot["observation"],
+                    "selection": snapshot["selection"],
+                },
+            )
+        return {
+            "run_id": run_id,
+            **result,
+            "replayed": False,
+            "observation": snapshot["observation"],
+            "selection": snapshot["selection"],
+            "input_sha256": input_sha256,
+        }
+
+    def scenario_run(self, actor_id: str, run_id: int) -> dict[str, Any]:
+        self._require_any(actor_id, ("scenario.run", "report.read", "audit.read"))
+        row = self.connection.execute(
+            "SELECT * FROM response_scenario_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("情景运行记录不存在")
+        snapshot = json.loads(row["input_snapshot_json"])
+        return {
+            "run_id": int(row["run_id"]),
+            "scenario_id": row["scenario_id"],
+            "state": "recorded",
+            "risk_index": row["risk_index"],
+            "duty_date": row["duty_date"],
+            "source_revision": row["source_revision"],
+            "input_sha256": row["input_sha256"],
+            "result": json.loads(row["result_json"]),
+            "observation": snapshot["observation"],
+            "observation_selector": snapshot["observation_selector"],
+            "selection": snapshot["selection"],
+            "input_snapshot": snapshot,
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+
+    def verify_scenario_run(self, actor_id: str, run_id: int) -> dict[str, Any]:
+        """用运行记录中固化的快照重新计算，校验旧结果是否仍可原样复现。"""
+        self._require_any(actor_id, ("scenario.run", "report.read", "audit.read"))
+        row = self.connection.execute(
+            "SELECT * FROM response_scenario_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("情景运行记录不存在")
+        scenario_row = self.connection.execute(
+            "SELECT * FROM response_scenarios WHERE scenario_id=?", (row["scenario_id"],)
+        ).fetchone()
+        snapshot = json.loads(row["input_snapshot_json"])
+        scenario = ResponseScenario.from_dict(json.loads(scenario_row["definition_json"]))
+        recomputed = self._projection_from_snapshot(scenario, snapshot)
+        stored_result = json.loads(row["result_json"])
+        snapshot_sha256 = digest(snapshot)
+        checks = {
+            "snapshot_hash_matches": snapshot_sha256 == row["input_sha256"],
+            "scenario_definition_matches": snapshot["scenario"]["definition_sha256"]
+            == scenario_row["content_sha256"],
+            "result_reproduces": canonical_json(recomputed) == canonical_json(stored_result),
+        }
+        return {
+            "run_id": int(row["run_id"]),
+            "scenario_id": row["scenario_id"],
+            "valid": all(checks.values()),
+            "checks": checks,
+            "input_sha256": row["input_sha256"],
+            "stored_result": stored_result,
+            "recomputed_result": recomputed,
+        }
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

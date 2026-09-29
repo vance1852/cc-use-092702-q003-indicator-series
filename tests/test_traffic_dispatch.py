@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from collection_logistics.api import JsonApplication
 from collection_logistics.clock import FrozenClock
-from collection_logistics.errors import Conflict, Forbidden
+from collection_logistics.errors import Conflict, Forbidden, InvalidState
 from collection_logistics.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak
 from collection_logistics.service import CollectionLogisticsService
 from collection_logistics.risk import DemandBucket, inventory_coverage, mark_to_risk, traffic_gap
@@ -108,15 +108,118 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
     def test_scenario_is_approved_and_replayed_by_input(self) -> None:
         self.risk_record(23, "98")
         self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
-        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}, "observation": {"risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23"}})
         with self.assertRaises(Forbidden):
             self.service.approve_scenario("plan", "restart", 1)
         self.service.approve_scenario("risk", "restart", 1)
-        first = self.service.run_scenario("plan", "restart", "2026-09-23")
-        second = self.service.run_scenario("plan", "restart", "2026-09-23")
+        first = self.service.run_scenario("plan", "restart")
+        second = self.service.run_scenario("plan", "restart")
         self.assertFalse(first["replayed"])
         self.assertTrue(second["replayed"])
         self.assertEqual(first["run_id"], second["run_id"])
+
+    def _scenario_payload(self, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "scenario_id": "trail-reopen",
+            "name": "雨后步道开放",
+            "risk_index_drop_percent": "0",
+            "route_capacity_changes": {},
+            "demand_changes": {},
+            "observation": {"risk_index": "HUMIDITY", "source_revision": "soil-rev-1", "duty_date": "2026-09-26"},
+        }
+        payload.update(overrides)
+        return payload
+
+    def _approve(self, payload: dict[str, object]) -> None:
+        self.service.create_scenario("plan", payload)
+        self.service.approve_scenario("risk", str(payload["scenario_id"]), 1)
+
+    def test_run_uses_bound_series_not_same_day_other_indicator(self) -> None:
+        # 同一天两类指标都更新：踩踏压力 87 与土壤含水率 62。
+        self.service.record_risk_record("plan", {"risk_index": "CONGESTION", "duty_date": "2026-09-26", "index_value": "87", "source_revision": "trample-rev-1", "observed_at": "2026-09-26T08:00:00Z"})
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-26", "index_value": "62", "source_revision": "soil-rev-1", "observed_at": "2026-09-26T07:30:00Z"})
+        self._approve(self._scenario_payload())
+        result = self.service.run_scenario("plan", "trail-reopen")
+        # 必须引用土壤含水率观测，而不是踩踏压力 87。
+        self.assertEqual(result["observation"]["risk_index"], "HUMIDITY")
+        self.assertEqual(result["observation"]["index_value"], "62")
+        self.assertEqual(result["observation"]["source_revision"], "soil-rev-1")
+        self.assertTrue(result["selection"]["matched"])
+        self.assertEqual(result["projected_risk_index_cny"], "62.00")
+
+    def test_run_stops_when_series_does_not_match(self) -> None:
+        # 现场只登记了踩踏压力，而情景要求土壤含水率：必须明确停止。
+        self.service.record_risk_record("plan", {"risk_index": "CONGESTION", "duty_date": "2026-09-26", "index_value": "87", "source_revision": "trample-rev-1", "observed_at": "2026-09-26T08:00:00Z"})
+        self._approve(self._scenario_payload())
+        with self.assertRaises(InvalidState):
+            self.service.run_scenario("plan", "trail-reopen")
+        blocked = self.connection.execute(
+            "SELECT event_type,payload_json FROM traffic_audit_events WHERE entity_type='scenario' "
+            "ORDER BY event_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(blocked["event_type"], "scenario.execution_blocked")
+        self.assertIn("no_matching_observation", blocked["payload_json"])
+
+    def test_run_stops_when_revision_or_date_does_not_match(self) -> None:
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-26", "index_value": "62", "source_revision": "soil-rev-2", "observed_at": "2026-09-26T09:00:00Z"})
+        self._approve(self._scenario_payload())
+        with self.assertRaises(InvalidState):
+            self.service.run_scenario("plan", "trail-reopen")
+
+    def test_later_revision_and_backfill_do_not_change_old_run(self) -> None:
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-26", "index_value": "62", "source_revision": "soil-rev-1", "observed_at": "2026-09-26T07:30:00Z"})
+        self._approve(self._scenario_payload())
+        first = self.service.run_scenario("plan", "trail-reopen")
+        self.assertEqual(first["observation"]["index_value"], "62")
+        # 同日发布修正修订，且补录一条更早日期的观测：旧结果必须保持不变。
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-26", "index_value": "55", "source_revision": "soil-rev-2", "observed_at": "2026-09-26T10:00:00Z"})
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-25", "index_value": "70", "source_revision": "soil-rev-0", "observed_at": "2026-09-25T08:00:00Z"})
+        replayed = self.service.run_scenario("plan", "trail-reopen")
+        self.assertTrue(replayed["replayed"])
+        self.assertEqual(replayed["run_id"], first["run_id"])
+        self.assertEqual(replayed["observation"]["index_value"], "62")
+        detail = self.service.scenario_run("audit", first["run_id"])
+        self.assertEqual(detail["observation"]["risk_record_id"], first["observation"]["risk_record_id"])
+        self.assertEqual(detail["input_sha256"], first["input_sha256"])
+
+    def test_snapshot_reproduces_identical_output(self) -> None:
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-26", "index_value": "62", "source_revision": "soil-rev-1", "observed_at": "2026-09-26T07:30:00Z"})
+        self._approve(self._scenario_payload(risk_index_drop_percent="10"))
+        run = self.service.run_scenario("plan", "trail-reopen")
+        verification = self.service.verify_scenario_run("audit", run["run_id"])
+        self.assertTrue(verification["valid"])
+        self.assertTrue(verification["checks"]["result_reproduces"])
+        self.assertEqual(verification["recomputed_result"], verification["stored_result"])
+        # 篡改快照后复算必须失败。
+        self.connection.execute(
+            "UPDATE response_scenario_runs SET input_snapshot_json=json_set(input_snapshot_json,'$.observation.index_value','1') WHERE run_id=?",
+            (run["run_id"],),
+        )
+        tampered = self.service.verify_scenario_run("audit", run["run_id"])
+        self.assertFalse(tampered["valid"])
+        self.assertFalse(tampered["checks"]["snapshot_hash_matches"])
+
+    def test_custom_indicator_series_is_supported(self) -> None:
+        self.service.record_risk_record("plan", {"risk_index": "CUSTOM:SOIL_MOISTURE", "duty_date": "2026-09-26", "index_value": "62", "source_revision": "soil-rev-1", "observed_at": "2026-09-26T07:30:00Z"})
+        payload = self._scenario_payload(
+            observation={"risk_index": "CUSTOM:SOIL_MOISTURE", "source_revision": "soil-rev-1", "duty_date": "2026-09-26"}
+        )
+        self._approve(payload)
+        result = self.service.run_scenario("plan", "trail-reopen")
+        self.assertEqual(result["observation"]["risk_index"], "CUSTOM:SOIL_MOISTURE")
+
+    def test_scenario_run_api_exposes_selection_and_snapshot(self) -> None:
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-26", "index_value": "62", "source_revision": "soil-rev-1", "observed_at": "2026-09-26T07:30:00Z"})
+        self._approve(self._scenario_payload())
+        app = JsonApplication(self.service)
+        run = self.service.run_scenario("plan", "trail-reopen")
+        detail = app.handle("GET", f"/scenarios/runs/{run['run_id']}", {"X-Actor-Id": "audit"})
+        self.assertEqual(detail.status, 200)
+        self.assertEqual(detail.body["observation"]["index_value"], "62")
+        self.assertEqual(detail.body["observation_selector"]["rule"], "exact_match_on_series_revision_and_duty_date")
+        verify = app.handle("POST", f"/scenarios/runs/{run['run_id']}/verify", {"X-Actor-Id": "audit"}, b"{}")
+        self.assertEqual(verify.status, 200)
+        self.assertTrue(verify.body["valid"])
 
     def test_audit_chain_detects_tampering(self) -> None:
         self.assertTrue(self.service.audit_chain("audit")["valid"])

@@ -163,12 +163,16 @@ CREATE TABLE IF NOT EXISTS response_scenarios (
 CREATE TABLE IF NOT EXISTS response_scenario_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     scenario_id TEXT NOT NULL REFERENCES response_scenarios(scenario_id),
-    as_of_date TEXT NOT NULL,
+    risk_record_id INTEGER NOT NULL REFERENCES risk_index_risk_records(risk_record_id),
+    risk_index TEXT NOT NULL,
+    duty_date TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    input_snapshot_json TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(scenario_id, as_of_date, input_sha256)
+    UNIQUE(scenario_id, risk_record_id, input_sha256)
 );
 
 CREATE TABLE IF NOT EXISTS traffic_idempotency (

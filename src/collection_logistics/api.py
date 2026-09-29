@@ -82,7 +82,11 @@ class JsonApplication:
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
-                return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+                return Response(200, self.service.run_scenario(actor, parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["scenarios", "runs"]:
+                return Response(200, self.service.scenario_run(actor, int(parts[2])))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["scenarios", "runs"] and parts[3] == "verify":
+                return Response(200, self.service.verify_scenario_run(actor, int(parts[2])))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
