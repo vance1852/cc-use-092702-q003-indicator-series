@@ -164,7 +164,9 @@ CREATE TABLE IF NOT EXISTS response_scenario_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     scenario_id TEXT NOT NULL REFERENCES response_scenarios(scenario_id),
     as_of_date TEXT NOT NULL,
+    risk_record_id INTEGER REFERENCES risk_index_risk_records(risk_record_id),
     input_sha256 TEXT NOT NULL,
+    input_snapshot_json TEXT NOT NULL DEFAULT '{}',
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL,
@@ -209,6 +211,22 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为旧版数据库补齐列；表结构以 SCHEMA 为准。"""
+    run_columns = _column_names(connection, "response_scenario_runs")
+    if run_columns and "risk_record_id" not in run_columns:
+        connection.execute("ALTER TABLE response_scenario_runs ADD COLUMN risk_record_id INTEGER")
+    if run_columns and "input_snapshot_json" not in run_columns:
+        connection.execute(
+            "ALTER TABLE response_scenario_runs ADD COLUMN input_snapshot_json TEXT NOT NULL DEFAULT '{}'"
+        )
 
 
 @contextmanager

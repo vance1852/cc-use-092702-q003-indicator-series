@@ -8,8 +8,9 @@ from decimal import Decimal
 
 from collection_logistics.api import JsonApplication
 from collection_logistics.clock import FrozenClock
-from collection_logistics.errors import Conflict, Forbidden
-from collection_logistics.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak
+from collection_logistics.errors import Conflict, Forbidden, InvalidState
+from collection_logistics.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak, scenario_projection
+from collection_logistics.models import ResponseScenario
 from collection_logistics.service import CollectionLogisticsService
 from collection_logistics.risk import DemandBucket, inventory_coverage, mark_to_risk, traffic_gap
 
@@ -108,7 +109,7 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
     def test_scenario_is_approved_and_replayed_by_input(self) -> None:
         self.risk_record(23, "98")
         self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
-        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
         with self.assertRaises(Forbidden):
             self.service.approve_scenario("plan", "restart", 1)
         self.service.approve_scenario("risk", "restart", 1)
@@ -117,6 +118,119 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
         self.assertFalse(first["replayed"])
         self.assertTrue(second["replayed"])
         self.assertEqual(first["run_id"], second["run_id"])
+        self.assertEqual(second["observation"]["risk_record_id"], first["observation"]["risk_record_id"])
+        self.assertEqual(second["observation"]["source_revision"], "r-23")
+        self.assertEqual(second["input_sha256"], first["input_sha256"])
+
+    def test_scenario_requires_constraint_fields_at_creation(self) -> None:
+        payload = {"scenario_id": "restart", "name": "雨后开放", "risk_index_drop_percent": "9"}
+        with self.assertRaises(Exception):
+            self.service.create_scenario("plan", payload)
+        payload.update({"risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23"})
+        created = self.service.create_scenario("plan", payload)
+        self.assertEqual(created["risk_index_constraint"], {
+            "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23",
+        })
+
+    def test_run_stops_without_exact_constraint_match(self) -> None:
+        # 同一天存在另一指标系列（游客踩踏压力）的观测，但情景要求土壤含水率
+        self.risk_record(23, "98")
+        self.service.record_risk_record("plan", {"risk_index": "CONGESTION", "duty_date": "2026-09-23", "index_value": "87", "source_revision": "r-23", "observed_at": "2026-09-23T20:00:00Z"})
+        self.service.create_scenario("plan", {"scenario_id": "rain-open", "name": "雨后开放", "risk_index": "HUMIDITY", "source_revision": "missing-rev", "duty_date": "2026-09-23", "risk_index_drop_percent": "0"})
+        self.service.approve_scenario("risk", "rain-open", 1)
+        with self.assertRaises(InvalidState) as context:
+            self.service.run_scenario("plan", "rain-open", "2026-09-23")
+        self.assertIn("source_revision=missing-rev", str(context.exception))
+        rows = self.connection.execute("SELECT count(*) FROM response_scenario_runs").fetchone()
+        self.assertEqual(rows[0], 0)
+
+    def test_run_rejects_wrong_series_even_when_other_series_is_newest(self) -> None:
+        # 旧逻辑会取到 duty_date<=? 的任意最新记录（CONGESTION 87）
+        self.risk_record(23, "98")
+        self.service.record_risk_record("plan", {"risk_index": "CONGESTION", "duty_date": "2026-09-23", "index_value": "87", "source_revision": "r-23", "observed_at": "2026-09-23T21:30:00Z"})
+        self.service.create_scenario("plan", {"scenario_id": "rain-open", "name": "雨后开放", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "0"})
+        self.service.approve_scenario("risk", "rain-open", 1)
+        run = self.service.run_scenario("plan", "rain-open", "2026-09-23")
+        self.assertEqual(run["observation"]["risk_index"], "HUMIDITY")
+        self.assertEqual(run["observation"]["index_value"], "98")
+        self.assertNotEqual(run["projected_risk_index_cny"], "87.00")
+
+    def test_run_rejects_date_other_than_fixed_duty_date(self) -> None:
+        self.risk_record(23, "98")
+        self.risk_record(24, "96")
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "0"})
+        self.service.approve_scenario("risk", "restart", 1)
+        with self.assertRaises(InvalidState):
+            self.service.run_scenario("plan", "restart", "2026-09-24")
+
+    def test_later_revision_does_not_alter_old_run(self) -> None:
+        self.risk_record(23, "98")
+        self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+        self.service.approve_scenario("risk", "restart", 1)
+        first = self.service.run_scenario("plan", "restart", "2026-09-23")
+        # 事后补录同日“更正修订”，情景固定的 r-23 仍精确命中旧观测，重放返回同一运行
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-23", "index_value": "50", "source_revision": "r-23-corrected", "observed_at": "2026-09-23T23:00:00Z"})
+        second = self.service.run_scenario("plan", "restart", "2026-09-23")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["run_id"], first["run_id"])
+        self.assertEqual(second["input_sha256"], first["input_sha256"])
+        self.assertEqual(second["projected_risk_index_cny"], first["projected_risk_index_cny"])
+        self.assertEqual(second["observation"]["index_value"], "98")
+        self.assertEqual(second["observation"]["source_revision"], "r-23")
+        detail = self.service.scenario_run("audit", first["run_id"])
+        self.assertEqual(detail["observation"]["index_value"], "98")
+        self.assertEqual(detail["projected_risk_index_cny"], first["projected_risk_index_cny"])
+
+    def test_old_run_snapshot_survives_live_catalog_rewrite(self) -> None:
+        self.risk_record(23, "98")
+        self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+        self.service.approve_scenario("risk", "restart", 1)
+        first = self.service.run_scenario("plan", "restart", "2026-09-23")
+        old_capacity = first["total_projected_capacity"]
+        old_inventory = first["demand_adjusted_inventory"]
+        # 直接改写路线和库存：旧运行记录中固化的快照与结果保持原样
+        self.connection.execute("UPDATE road_corridors SET hourly_capacity='1' WHERE corridor_id='transfer-east-1'")
+        self.connection.execute("UPDATE preservation_resource_lots SET available_units='0' WHERE preservation_resource_lot_id='lot-1'")
+        detail = self.service.scenario_run("audit", first["run_id"])
+        self.assertEqual(detail["total_projected_capacity"], old_capacity)
+        self.assertEqual(detail["demand_adjusted_inventory"], old_inventory)
+        self.assertEqual(detail["input_snapshot"]["road_corridors"][0]["hourly_capacity"], "100000")
+        self.assertEqual(detail["input_snapshot"]["inventory"][0]["available_units"], 60000.0)
+
+    def test_same_snapshot_reproduces_same_output(self) -> None:
+        self.risk_record(23, "98")
+        self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+        self.service.approve_scenario("risk", "restart", 1)
+        run = self.service.run_scenario("plan", "restart", "2026-09-23")
+        snapshot = run["input_snapshot"]
+        # 用快照中的同一条观测重新计算，输出与已批准结论完全一致
+        reproduced = scenario_projection(
+            current_index=Decimal(snapshot["observation"]["index_value"]),
+            risk_index_drop_percent=ResponseScenario.from_dict(snapshot["scenario"]["definition"]).risk_index_drop_percent,
+            road_corridors=snapshot["road_corridors"],
+            inventory=snapshot["inventory"],
+            route_capacity_changes=ResponseScenario.from_dict(snapshot["scenario"]["definition"]).route_capacity_changes,
+            demand_changes=ResponseScenario.from_dict(snapshot["scenario"]["definition"]).demand_changes,
+        )
+        self.assertEqual(reproduced["projected_risk_index_cny"], run["projected_risk_index_cny"])
+        self.assertEqual(reproduced["total_projected_capacity"], run["total_projected_capacity"])
+        self.assertEqual(reproduced["demand_adjusted_inventory"], run["demand_adjusted_inventory"])
+
+    def test_scenario_run_detail_explains_match_and_lists_runs(self) -> None:
+        self.risk_record(23, "98")
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "source_revision": "r-23", "duty_date": "2026-09-23", "risk_index_drop_percent": "0"})
+        self.service.approve_scenario("risk", "restart", 1)
+        run = self.service.run_scenario("plan", "restart", "2026-09-23")
+        detail = self.service.scenario_run("audit", run["run_id"])
+        self.assertEqual(detail["constraint"], run["constraint"])
+        self.assertEqual(detail["observation"]["risk_record_id"], run["observation"]["risk_record_id"])
+        self.assertTrue(detail["input_snapshot"]["match"]["exact_match"])
+        listing = self.service.scenario_runs("audit", "restart")
+        self.assertEqual([item["run_id"] for item in listing["runs"]], [run["run_id"]])
+        self.assertEqual(listing["runs"][0]["risk_record_id"], run["observation"]["risk_record_id"])
 
     def test_audit_chain_detects_tampering(self) -> None:
         self.assertTrue(self.service.audit_chain("audit")["valid"])

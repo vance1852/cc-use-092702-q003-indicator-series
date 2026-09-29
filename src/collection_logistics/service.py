@@ -11,7 +11,15 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import (
+    RiskIndexRecord,
+    ResponseCenter,
+    PreservationResourceLot,
+    DispatchRequest,
+    RoadCorridor,
+    ResponseScenario,
+    date_text,
+)
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -99,6 +107,12 @@ class CollectionLogisticsService:
                 body["created_at"],
             ),
         )
+
+    def _require_any(self, user_id: str, permissions: Iterable[str]) -> sqlite3.Row:
+        user = self._user(user_id)
+        if not any(permission in ROLE_PERMISSIONS[user["role"]] for permission in permissions):
+            raise Forbidden(f"角色 {user['role']} 无权执行该查询")
+        return user
 
     def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
         if role not in ROLE_PERMISSIONS:
@@ -470,6 +484,11 @@ class CollectionLogisticsService:
         scenario = ResponseScenario.from_dict(raw)
         definition = canonical_json(raw)
         content_sha256 = hashlib.sha256(definition.encode("utf-8")).hexdigest()
+        constraint = {
+            "risk_index": scenario.risk_index,
+            "source_revision": scenario.source_revision,
+            "duty_date": scenario.duty_date,
+        }
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
@@ -477,10 +496,16 @@ class CollectionLogisticsService:
                     "VALUES(?,?,?,?,?,?)",
                     (scenario.scenario_id, scenario.name, definition, content_sha256, actor_id, self._now()),
                 )
-                self._audit("scenario", scenario.scenario_id, "scenario.created", actor_id, {"sha256": content_sha256})
+                self._audit(
+                    "scenario",
+                    scenario.scenario_id,
+                    "scenario.created",
+                    actor_id,
+                    {"sha256": content_sha256, "risk_index_constraint": constraint},
+                )
         except sqlite3.IntegrityError as exc:
             raise Conflict("情景编号或内容已经存在") from exc
-        return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256}
+        return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256, "risk_index_constraint": constraint}
 
     def approve_scenario(self, actor_id: str, scenario_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "scenario.approve")
@@ -497,6 +522,7 @@ class CollectionLogisticsService:
 
     def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
         self._require(actor_id, "scenario.run")
+        run_date = date_text(as_of_date, "as_of_date")
         row = self.connection.execute(
             "SELECT * FROM response_scenarios WHERE scenario_id=?", (scenario_id,)
         ).fetchone()
@@ -505,31 +531,76 @@ class CollectionLogisticsService:
         if row["state"] != "approved":
             raise InvalidState("只有已批准情景可以运行")
         scenario = ResponseScenario.from_dict(json.loads(row["definition_json"]))
+        constraint = {
+            "risk_index": scenario.risk_index,
+            "source_revision": scenario.source_revision,
+            "duty_date": scenario.duty_date,
+        }
+        if run_date != scenario.duty_date:
+            raise InvalidState(
+                f"情景适用日期固定为 {scenario.duty_date}，不能对 {run_date} 运行"
+            )
+        # 运行时只允许读取与情景约束（指标系列+适用日期+来源修订）完全相符的观测版本；
+        # 表上 UNIQUE(risk_index, duty_date, source_revision) 保证至多命中一条。
         index_row = self.connection.execute(
-            "SELECT index_value FROM risk_index_risk_records WHERE duty_date<=? ORDER BY duty_date DESC,risk_record_id DESC LIMIT 1",
-            (as_of_date,),
+            "SELECT * FROM risk_index_risk_records "
+            "WHERE risk_index=? AND duty_date=? AND source_revision=?",
+            (scenario.risk_index, scenario.duty_date, scenario.source_revision),
         ).fetchone()
         if index_row is None:
-            raise InvalidState("截止日期没有可用风险指数")
+            available = self.connection.execute(
+                "SELECT source_revision FROM risk_index_risk_records WHERE risk_index=? AND duty_date=?",
+                (scenario.risk_index, scenario.duty_date),
+            ).fetchall()
+            revisions = [item["source_revision"] for item in available]
+            raise InvalidState(
+                "没有匹配情景约束的风险指数观测，情景运行停止："
+                f"risk_index={scenario.risk_index}, duty_date={scenario.duty_date}, "
+                f"source_revision={scenario.source_revision}"
+                + (f"；当日仅有来源修订 {revisions}" if revisions else "；当日无任何观测")
+            )
         road_corridors = self.connection.execute("SELECT * FROM road_corridors WHERE state='active' ORDER BY corridor_id").fetchall()
         inventory = self.connection.execute(
             "SELECT center_id,preservation_resource_kind,sum(CAST(available_units AS REAL)) available_units "
             "FROM preservation_resource_lots GROUP BY center_id,preservation_resource_kind ORDER BY center_id,preservation_resource_kind"
         ).fetchall()
-        input_value = {
-            "scenario_sha256": row["content_sha256"],
-            "as_of_date": as_of_date,
-            "index": index_row["index_value"],
+        observation = {
+            "risk_record_id": index_row["risk_record_id"],
+            "risk_index": index_row["risk_index"],
+            "duty_date": index_row["duty_date"],
+            "index_value": index_row["index_value"],
+            "source_revision": index_row["source_revision"],
+            "observed_at": index_row["observed_at"],
+            "recorded_by": index_row["recorded_by"],
+            "recorded_at": index_row["recorded_at"],
+        }
+        input_snapshot = {
+            "scenario": {
+                "scenario_id": scenario_id,
+                "content_sha256": row["content_sha256"],
+                "definition": json.loads(row["definition_json"]),
+            },
+            "as_of_date": run_date,
+            "constraint": constraint,
+            "observation": observation,
+            "match": {
+                "matched_fields": ["risk_index", "duty_date", "source_revision"],
+                "risk_index": scenario.risk_index,
+                "duty_date": scenario.duty_date,
+                "source_revision": scenario.source_revision,
+                "exact_match": True,
+            },
             "road_corridors": [dict(item) for item in road_corridors],
             "inventory": [dict(item) for item in inventory],
         }
-        input_sha256 = digest(input_value)
+        input_sha256 = digest(input_snapshot)
         existing = self.connection.execute(
-            "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
-            (scenario_id, as_of_date, input_sha256),
+            "SELECT run_id,risk_record_id,input_sha256,input_snapshot_json,result_json FROM response_scenario_runs "
+            "WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
+            (scenario_id, run_date, input_sha256),
         ).fetchone()
         if existing is not None:
-            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
+            return self._scenario_run_response(existing, replayed=True)
         result = scenario_projection(
             current_index=Decimal(index_row["index_value"]),
             risk_index_drop_percent=scenario.risk_index_drop_percent,
@@ -540,13 +611,94 @@ class CollectionLogisticsService:
         )
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
-                "INSERT INTO response_scenario_runs(scenario_id,as_of_date,input_sha256,result_json,created_by,created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
+                "INSERT INTO response_scenario_runs(scenario_id,as_of_date,risk_record_id,input_sha256,"
+                "input_snapshot_json,result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    scenario_id,
+                    run_date,
+                    index_row["risk_record_id"],
+                    input_sha256,
+                    canonical_json(input_snapshot),
+                    canonical_json(result),
+                    actor_id,
+                    self._now(),
+                ),
             )
             run_id = int(cursor.lastrowid)
-            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
-        return {"run_id": run_id, **result, "replayed": False}
+            self._audit(
+                "scenario",
+                scenario_id,
+                "scenario.executed",
+                actor_id,
+                {
+                    "run_id": run_id,
+                    "input_sha256": input_sha256,
+                    "risk_record_id": observation["risk_record_id"],
+                    "observation": {
+                        "risk_index": observation["risk_index"],
+                        "duty_date": observation["duty_date"],
+                        "source_revision": observation["source_revision"],
+                        "index_value": observation["index_value"],
+                        "observed_at": observation["observed_at"],
+                    },
+                    "constraint": constraint,
+                    "match_reason": "risk_index、duty_date、source_revision 与情景约束完全相符",
+                },
+            )
+        return {
+            "run_id": run_id,
+            **result,
+            "replayed": False,
+            "input_sha256": input_sha256,
+            "observation": observation,
+            "constraint": constraint,
+            "input_snapshot": input_snapshot,
+        }
+
+    @staticmethod
+    def _scenario_run_response(run_row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
+        snapshot = json.loads(run_row["input_snapshot_json"])
+        result = json.loads(run_row["result_json"])
+        return {
+            "run_id": run_row["run_id"],
+            **result,
+            "replayed": replayed,
+            "input_sha256": run_row["input_sha256"],
+            "observation": snapshot.get("observation"),
+            "constraint": snapshot.get("constraint"),
+            "input_snapshot": snapshot,
+        }
+
+    def scenario_run(self, actor_id: str, run_id: int) -> dict[str, Any]:
+        self._require_any(actor_id, ("scenario.run", "report.read", "audit.read"))
+        run_row = self.connection.execute(
+            "SELECT * FROM response_scenario_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if run_row is None:
+            raise NotFound("情景运行记录不存在")
+        return self._scenario_run_response(run_row, replayed=False)
+
+    def scenario_runs(self, actor_id: str, scenario_id: str) -> dict[str, Any]:
+        self._require_any(actor_id, ("scenario.run", "report.read", "audit.read"))
+        rows = self.connection.execute(
+            "SELECT run_id,as_of_date,risk_record_id,input_sha256,created_by,created_at "
+            "FROM response_scenario_runs WHERE scenario_id=? ORDER BY run_id",
+            (scenario_id,),
+        ).fetchall()
+        return {
+            "scenario_id": scenario_id,
+            "runs": [
+                {
+                    "run_id": row["run_id"],
+                    "as_of_date": row["as_of_date"],
+                    "risk_record_id": row["risk_record_id"],
+                    "input_sha256": row["input_sha256"],
+                    "created_by": row["created_by"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ],
+        }
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")
